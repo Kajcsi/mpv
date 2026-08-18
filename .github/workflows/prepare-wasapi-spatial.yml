@@ -1,8 +1,8 @@
 name: Prepare Windows Spatial Audio change
 
 on:
-  push:
-    branches: [prepare-wasapi-spatial-pr]
+  pull_request:
+    branches: [master]
 
 permissions:
   contents: write
@@ -12,9 +12,10 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
     steps:
-      - name: Check out the branch
+      - name: Check out the source branch
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Set up MSYS2
@@ -71,8 +72,9 @@ jobs:
         run: |
           rm .github/prepare-wasapi-spatial.py
           rm .github/workflows/prepare-wasapi-spatial.yml
+          rm -f .ci-run
           git config user.name "Kaj"
           git config user.email "64730213+Kajcsi@users.noreply.github.com"
           git add -A
           git commit -m "ao_wasapi: add Windows Spatial Audio output"
-          git push origin HEAD:prepare-wasapi-spatial-pr
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
