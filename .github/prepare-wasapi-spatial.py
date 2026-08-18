@@ -21,9 +21,9 @@ SOURCE = r'''/*
 
 #include <stdint.h>
 #include <stdatomic.h>
+#include <string.h>
 
 #include <audioclient.h>
-#include <ksmedia.h>
 #include <mmdeviceapi.h>
 #include <propsys.h>
 #include <windows.h>
@@ -43,25 +43,19 @@ SOURCE = r'''/*
 #include "osdep/timer.h"
 #include "osdep/windows_utils.h"
 
-enum spatial_command {
-    SPATIAL_COMMAND_NONE,
-    SPATIAL_COMMAND_START,
-    SPATIAL_COMMAND_STOP,
-    SPATIAL_COMMAND_RESET,
-    SPATIAL_COMMAND_SHUTDOWN,
-};
-
 struct spatial_object {
     AudioObjectType type;
     ISpatialAudioObject *object;
 };
 
 struct priv {
-    HANDLE thread;
+    mp_thread thread;
     HANDLE init_done;
     HANDLE command_event;
     HANDLE render_event;
-    atomic_int command;
+    atomic_bool shutdown;
+    atomic_bool reset_requested;
+    atomic_bool running_requested;
     bool init_ok;
     bool started;
 
@@ -225,8 +219,13 @@ static bool is_float32_object_format(const WAVEFORMATEX *format)
         format->cbSize < sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX))
         return false;
 
+    static const GUID ieee_float_subtype = {
+        WAVE_FORMAT_IEEE_FLOAT, 0x0000, 0x0010,
+        {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71},
+    };
     const WAVEFORMATEXTENSIBLE *ext = (const WAVEFORMATEXTENSIBLE *)format;
-    return IsEqualGUID(&ext->SubFormat, &KSDATAFORMAT_SUBTYPE_IEEE_FLOAT);
+    return memcmp(&ext->SubFormat, &ieee_float_subtype,
+                  sizeof(ieee_float_subtype)) == 0;
 }
 
 static bool select_object_format(struct ao *ao)
@@ -412,7 +411,10 @@ static int64_t estimate_output_time(struct ao *ao, UINT32 frames)
 
     if (p->clock && p->clock_frequency) {
         UINT64 position = 0;
-        if (SUCCEEDED(IAudioClock_GetPosition(p->clock, &position, NULL))) {
+        UINT64 qpc_position = 0;
+        if (SUCCEEDED(IAudioClock_GetPosition(
+                p->clock, &position, &qpc_position)))
+        {
             double played = (double)position * ao->samplerate /
                             (double)p->clock_frequency;
             if ((double)p->submitted_frames > played)
@@ -438,6 +440,7 @@ static bool feed_spatial(struct ao *ao)
                mp_HRESULT_to_str(hr));
         return false;
     }
+    (void)available_dynamic;
 
     void *planes[MP_NUM_CHANNELS] = {0};
     bool valid = frames > 0 && frames <= p->max_frames;
@@ -466,7 +469,7 @@ static bool feed_spatial(struct ao *ao)
         planes[n] = buffer;
     }
 
-    bool eof = false;
+    bool eof = 0;
     if (valid) {
         ao_read_data(ao, planes, frames, estimate_output_time(ao, frames),
                      &eof, true, true);
@@ -486,29 +489,26 @@ static bool feed_spatial(struct ao *ao)
     return valid;
 }
 
-static bool process_command(struct ao *ao)
+static bool process_requests(struct ao *ao)
 {
     struct priv *p = ao->priv;
-    int command = atomic_exchange(&p->command, SPATIAL_COMMAND_NONE);
 
-    switch (command) {
-    case SPATIAL_COMMAND_NONE:
-        return true;
-    case SPATIAL_COMMAND_START:
+    if (atomic_load(&p->shutdown))
+        return false;
+
+    if (atomic_exchange(&p->reset_requested, false) &&
+        !reset_stream(ao))
+        return false;
+
+    bool should_run = atomic_load(&p->running_requested);
+    if (should_run && !p->started)
         return start_stream(ao);
-    case SPATIAL_COMMAND_STOP:
+    if (!should_run && p->started)
         return stop_stream(ao);
-    case SPATIAL_COMMAND_RESET:
-        return reset_stream(ao);
-    case SPATIAL_COMMAND_SHUTDOWN:
-        return false;
-    default:
-        MP_ERR(ao, "Unknown spatial audio command: %d\n", command);
-        return false;
-    }
+    return true;
 }
 
-static DWORD WINAPI spatial_thread(void *ctx)
+static MP_THREAD_VOID spatial_thread(void *ctx)
 {
     struct ao *ao = ctx;
     struct priv *p = ao->priv;
@@ -525,10 +525,10 @@ static DWORD WINAPI spatial_thread(void *ctx)
     while (true) {
         DWORD timeout = p->started ? 100 : INFINITE;
         DWORD result = WaitForMultipleObjects(MP_ARRAY_SIZE(waits), waits,
-                                              FALSE, timeout);
+                                              false, timeout);
         if (result == WAIT_OBJECT_0) {
             render_timeouts = 0;
-            if (!process_command(ao))
+            if (!process_requests(ao))
                 break;
         } else if (result == WAIT_OBJECT_0 + 1) {
             render_timeouts = 0;
@@ -555,13 +555,12 @@ done:
     release_spatial(ao);
     if (SUCCEEDED(co_hr))
         CoUninitialize();
-    return 0;
+    MP_THREAD_RETURN();
 }
 
-static void signal_command(struct ao *ao, enum spatial_command command)
+static void signal_requests(struct ao *ao)
 {
     struct priv *p = ao->priv;
-    atomic_store(&p->command, command);
     SetEvent(p->command_event);
 }
 
@@ -570,9 +569,9 @@ static void uninit(struct ao *ao)
     struct priv *p = ao->priv;
 
     if (p->thread) {
-        signal_command(ao, SPATIAL_COMMAND_SHUTDOWN);
-        WaitForSingleObject(p->thread, INFINITE);
-        CloseHandle(p->thread);
+        atomic_store(&p->shutdown, true);
+        signal_requests(ao);
+        mp_thread_join(p->thread);
         p->thread = NULL;
     }
     if (p->init_done) {
@@ -599,18 +598,19 @@ static int init(struct ao *ao)
         return -1;
     }
 
-    p->init_done = CreateEventW(NULL, FALSE, FALSE, NULL);
-    p->command_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    p->render_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    p->init_done = CreateEventW(NULL, false, false, NULL);
+    p->command_event = CreateEventW(NULL, false, false, NULL);
+    p->render_event = CreateEventW(NULL, false, false, NULL);
     if (!p->init_done || !p->command_event || !p->render_event) {
         MP_ERR(ao, "Creating spatial audio events failed.\n");
         uninit(ao);
         return -1;
     }
 
-    atomic_store(&p->command, SPATIAL_COMMAND_NONE);
-    p->thread = CreateThread(NULL, 0, spatial_thread, ao, 0, NULL);
-    if (!p->thread) {
+    atomic_store(&p->shutdown, false);
+    atomic_store(&p->reset_requested, false);
+    atomic_store(&p->running_requested, false);
+    if (mp_thread_create(&p->thread, spatial_thread, ao)) {
         MP_ERR(ao, "Creating the spatial audio thread failed.\n");
         uninit(ao);
         return -1;
@@ -628,18 +628,24 @@ static int init(struct ao *ao)
 
 static void reset(struct ao *ao)
 {
-    signal_command(ao, SPATIAL_COMMAND_RESET);
+    struct priv *p = ao->priv;
+    atomic_store(&p->running_requested, false);
+    atomic_store(&p->reset_requested, true);
+    signal_requests(ao);
 }
 
 static void start(struct ao *ao)
 {
-    signal_command(ao, SPATIAL_COMMAND_START);
+    struct priv *p = ao->priv;
+    atomic_store(&p->running_requested, true);
+    signal_requests(ao);
 }
 
 static bool set_pause(struct ao *ao, bool paused)
 {
-    signal_command(ao, paused ? SPATIAL_COMMAND_STOP :
-                                SPATIAL_COMMAND_START);
+    struct priv *p = ao->priv;
+    atomic_store(&p->running_requested, !paused);
+    signal_requests(ao);
     return true;
 }
 
