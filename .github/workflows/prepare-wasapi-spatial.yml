@@ -1,0 +1,78 @@
+name: Prepare Windows Spatial Audio change
+
+on:
+  push:
+    branches: [prepare-wasapi-spatial-pr]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out the branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            mingw-w64-ucrt-x86_64-binutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-meson
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-mpv
+
+      - name: Apply the source change
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          python3 .github/prepare-wasapi-spatial.py
+          git diff --check
+
+      - name: Configure mpv
+        shell: msys2 {0}
+        run: |
+          set -euo pipefail
+          meson setup build \
+            --buildtype=release \
+            -Dlibmpv=true \
+            -Dtests=false \
+            -Dbuild-date=false \
+            -Dwasapi=enabled \
+            -Dd3d11=enabled \
+            -Dshaderc=enabled \
+            -Dspirv-cross=enabled \
+            -Dmanpage-build=disabled \
+            -Dhtml-build=disabled \
+            -Dpdf-build=disabled \
+            -Djavascript=disabled \
+            -Dlua=disabled \
+            -Dvapoursynth=disabled \
+            -Ddvdnav=disabled \
+            -Dlibbluray=disabled \
+            -Drubberband=disabled \
+            -Duchardet=disabled
+
+      - name: Build mpv
+        shell: msys2 {0}
+        run: meson compile -C build
+
+      - name: Commit the tested source change
+        shell: bash
+        run: |
+          rm .github/prepare-wasapi-spatial.py
+          rm .github/workflows/prepare-wasapi-spatial.yml
+          git config user.name "Kaj"
+          git config user.email "64730213+Kajcsi@users.noreply.github.com"
+          git add -A
+          git commit -m "ao_wasapi: add Windows Spatial Audio output"
+          git push origin HEAD:prepare-wasapi-spatial-pr
